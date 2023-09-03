@@ -323,18 +323,18 @@ class AnimationInpaintPipeline(DiffusionPipeline):
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
         return latents
-
-    def prepare_image_latents(self, image, timestep, batch_size, dtype, device, generator):
-        image = image.to(device=device, dtype=dtype)
-        init_latent_dist = self.vae.encode(image).latent_dist
-        init_latents = init_latent_dist.sample(generator=generator)
+    
+    def encode_images(self, batch_size, images, dtype, device, generator):
+        # F C H W
+        images = torch.cat(images, dim=0).to(device=device, dtype=dtype)
+        latents_dist = self.vae.encode(images).latent_dist
+        init_latents = latents_dist.sample(generator=generator)
         init_latents = 0.18215 * init_latents
+        
+        # F C H W -> B C F H W
+        init_latents = rearrange(init_latents, "f c h w -> 1 c f h w")
         init_latents = torch.cat([init_latents] * batch_size, dim=0)
-        init_latents_orig = init_latents
-        noise = torch.randn(init_latents.shape, device=device, dtype=dtype)
-        init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
-        latents = init_latents
-        return latents, init_latents_orig, noise
+        return init_latents
     
     @torch.no_grad()
     def __call__(
@@ -395,7 +395,20 @@ class AnimationInpaintPipeline(DiffusionPipeline):
 
         # Prepare latent variables
         num_channels_latents = self.unet.in_channels
-        # latents shape is [Batch, Channel, Frame, Height, Width]
+
+        # Prepare image latents
+        # preprocess all keyframes
+        for keyframe_idx, keyframe in keyframes.items():
+            if isinstance(keyframe, PIL.Image.Image):
+                keyframes[keyframe_idx] = self.preprocess_image(keyframe)
+        
+        # encode all keyframes
+        if len(keyframes) > 0:
+            keyframes_latents = self.encode_images(batch_size * num_videos_per_prompt, tuple(keyframes.values()), text_embeddings.dtype, device, generator)
+        else:
+            keyframes_latents = None
+
+        # Prepare latents
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
@@ -409,38 +422,9 @@ class AnimationInpaintPipeline(DiffusionPipeline):
         )
         latents_dtype = latents.dtype
 
-        # Prepare mask for keyframes
-        # mask shape is [Batch, Channel, Frame, Height, Width]
-        # and is 1 for [Batch, Channel, keyframe, Height, Width] and 0 for others
-        zeros = torch.zeros(
-            (
-                batch_size * num_videos_per_prompt,
-                num_channels_latents,
-                video_length,
-                int(height / self.vae_scale_factor),
-                int(width / self.vae_scale_factor)
-            ),
-            device=device
-        )
-        mask = zeros.clone()
-        for keyframe_idx in keyframes.keys():
-            mask[:, :, keyframe_idx, :, :] = 1
+        keyframe_numbers = tuple(keyframes.keys())
 
-        # Prepare image latents
-        # preprocess all keyframes
-        keyframes_latents = zeros.clone()
-        keyframes_init_latents_orig = zeros.clone()
-        keyframes_noise = zeros.clone()
-        latent_timestep = timesteps[:1].repeat(batch_size * num_videos_per_prompt)
-        for keyframe_idx, keyframe in keyframes.items():
-            if isinstance(keyframe, PIL.Image.Image):
-                keyframe = self.preprocess_image(keyframe)
-            keyframe_latents, keyframe_init_latents_orig, keyframe_noise = self.prepare_image_latents(keyframe, latent_timestep, batch_size * num_videos_per_prompt, text_embeddings.dtype, device, generator)
-            keyframes_latents[:, :, keyframe_idx, :, :] = keyframe_latents
-            keyframes_init_latents_orig[:, :, keyframe_idx, :, :] = keyframe_init_latents_orig
-            keyframes_noise[:, :, keyframe_idx, :, :] = keyframe_noise
-        
-        latents = keyframes_latents * mask + latents * (1 - mask)
+        keyframes_latents_noise = latents[:, :, keyframe_numbers, :, :]
 
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -448,35 +432,25 @@ class AnimationInpaintPipeline(DiffusionPipeline):
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
-        # enable gradient checkpointing
-        self.unet.enable_gradient_checkpointing()
-
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # clear the cache
-                gc.collect()
-                torch.cuda.empty_cache()
-
                 with torch.enable_grad():
-                    # latents needs gradients for the backward pass in reconstruction guidance
+                    # clear cache
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    # latents except keyframes needs gradient for the backward pass
                     if do_reconstruction_guidance:
-                        latents = latents.detach().requires_grad_(True)
+                        latents = latents.requires_grad_()
                         initial_latents = latents
+
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                     # predict the noise residual
                     noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
-                    # noise_pred = []
-                    # import pdb
-                    # pdb.set_trace()
-                    # for batch_idx in range(latent_model_input.shape[0]):
-                    #     noise_pred_single = self.unet(latent_model_input[batch_idx:batch_idx+1], t, encoder_hidden_states=text_embeddings[batch_idx:batch_idx+1]).sample.to(dtype=latents_dtype)
-                    #     noise_pred.append(noise_pred_single)
-                    # noise_pred = torch.cat(noise_pred)
 
-                    # perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
@@ -486,43 +460,53 @@ class AnimationInpaintPipeline(DiffusionPipeline):
 
                     # reconstruction guidance
                     if do_reconstruction_guidance:
-                        # get alpha from scheduler
-                        alpha_t = self.scheduler.alphas_cumprod[t] ** 0.5
-                        # filter out frames that is not the keyframes from the latents
-                        hat_latent_a = latents * mask
-                        latent_a = keyframes_init_latents_orig * mask
                         # compute the reconstruction loss
-                        #reconstruction_loss = torch.nn.functional.mse_loss(hat_latent_a, latent_a)
-                        # compute the gradient of the reconstruction loss
-                        #reconstruction_loss.backward()
-                        # update the frames that is not the keyframes
-                        #latents = latents - ((7) / 2) * initial_latents.grad * ( 1 - mask )
-                        # reset the gradient
-                        initial_latents.grad = None
-                        for param in self.unet.parameters():
-                            param.grad = None
+                        reconstruction_loss = torch.nn.functional.mse_loss(
+                            keyframes_latents,
+                            latents[:, :, keyframe_numbers, :, :],
+                        )
 
-                # masking
-                if add_predicted_noise:
-                    init_latents_proper = self.scheduler.add_noise(
-                        keyframes_init_latents_orig,
-                        noise_pred_uncond,
-                        torch.tensor([t])
-                    )
-                else:
-                    init_latents_proper = self.scheduler.add_noise(
-                        keyframes_init_latents_orig,
-                        keyframes_noise,
-                        torch.tensor([t])
-                    )
+                        # compute the gradients
+                        reconstruction_grad = torch.autograd.grad(
+                            reconstruction_loss,
+                            initial_latents,
+                        )[0]
+                        print(reconstruction_grad)
 
-                latents = init_latents_proper * mask + latents * (1 - mask)
+                        alpha_t = self.scheduler.alphas_cumprod[t] ** 0.5
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                        # compute the guidance
+                        guidance = reconstruction_guidance_scale * alpha_t / 2 * reconstruction_grad
+
+                        # add the guidance to the latents
+                        latents = latents - guidance
+
+                        initial_latents.detach_()
+                        del initial_latents
+
+                    # masking
+                    if keyframes_latents is not None:
+                        if add_predicted_noise:
+                            keyframes_noise_pred_uncond = noise_pred_uncond[:, :, keyframe_numbers, :, :]
+                            keyframes_latents_orig_proper = self.scheduler.add_noise(
+                                keyframes_latents,
+                                keyframes_noise_pred_uncond,
+                                torch.tensor([t])
+                            )
+                        else:
+                            keyframes_latents_orig_proper = self.scheduler.add_noise(
+                                keyframes_latents,
+                                keyframes_latents_noise,
+                                torch.tensor([t])
+                            )
+
+                        latents[:, :, keyframe_numbers, :, :] = keyframes_latents_orig_proper
+
+                    # call the callback, if provided
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback is not None and i % callback_steps == 0:
+                            callback(i, t, latents)
 
         # Post-processing
         video = self.decode_latents(latents)
