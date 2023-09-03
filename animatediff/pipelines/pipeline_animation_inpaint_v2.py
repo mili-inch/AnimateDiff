@@ -456,14 +456,16 @@ class AnimationInpaintPipeline(DiffusionPipeline):
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                    scheduled = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+                    latents = scheduled.prev_sample
+                    pred_original_latents = scheduled.pred_original_sample
 
                     # reconstruction guidance
                     if do_reconstruction_guidance:
                         # compute the reconstruction loss
                         reconstruction_loss = torch.nn.functional.mse_loss(
                             keyframes_latents,
-                            latents[:, :, keyframe_numbers, :, :],
+                            pred_original_latents[:, :, keyframe_numbers, :, :],
                         )
 
                         # compute the gradients
