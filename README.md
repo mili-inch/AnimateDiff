@@ -1,3 +1,13 @@
+# AnimateDiff Inpainting
+
+This repository is implementation of video inpainting pipeline based on AnimateDiff and method of Inverse Problem with Diffusion Models.
+
+Reference:
+![Video Diffusion Models](https://arxiv.org/abs/2204.03458)
+![Pseudoinverse-Guided Diffusion Models for Inverse Problems](https://openreview.net/forum?id=9_gsMA8MRKQ)
+
+Below is the original README of AnimateDiff.
+
 # AnimateDiff
 
 This repository is the official implementation of [AnimateDiff](https://arxiv.org/abs/2307.04725).

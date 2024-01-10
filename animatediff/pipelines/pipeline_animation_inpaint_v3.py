@@ -432,16 +432,18 @@ class AnimationInpaintPipeline(DiffusionPipeline):
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        self.unet.enable_gradient_checkpointing()
+        self.unet.requires_grad_(False)
+
+        with self.progress_bar(total=num_inference_steps) as progress_bar:          
             for i, t in enumerate(timesteps):
                 with torch.enable_grad():
                     # clear cache
-                    gc.collect()
                     torch.cuda.empty_cache()
 
                     # latents except keyframes needs gradient for the backward pass
                     if do_reconstruction_guidance:
-                        latents = latents.requires_grad_()
+                        latents = latents.detach().requires_grad_()
                         initial_latents = latents
 
                     # expand the latents if we are doing classifier free guidance
@@ -465,15 +467,13 @@ class AnimationInpaintPipeline(DiffusionPipeline):
                         # compute the reconstruction loss
                         reconstruction_loss = torch.nn.functional.mse_loss(
                             keyframes_latents,
-                            pred_original_latents[:, :, keyframe_numbers, :, :],
+                            pred_original_latents[:, :, keyframe_numbers],
                         )
+                        reconstruction_loss.backward()
+
+                        reconstruction_grad = initial_latents.grad.detach()
 
                         # compute the gradients
-                        reconstruction_grad = torch.autograd.grad(
-                            reconstruction_loss,
-                            initial_latents,
-                        )[0]
-
                         alpha_t = self.scheduler.alphas_cumprod[t] ** 0.5
 
                         # compute the guidance
@@ -482,13 +482,12 @@ class AnimationInpaintPipeline(DiffusionPipeline):
                         # add the guidance to the latents
                         latents = latents - guidance
 
-                        initial_latents.detach_()
                         del initial_latents
 
                     # masking
                     if keyframes_latents is not None:
                         if add_predicted_noise:
-                            keyframes_noise_pred_uncond = noise_pred_uncond[:, :, keyframe_numbers, :, :]
+                            keyframes_noise_pred_uncond = noise_pred_uncond[:, :, keyframe_numbers]
                             keyframes_latents_orig_proper = self.scheduler.add_noise(
                                 keyframes_latents,
                                 keyframes_noise_pred_uncond,
@@ -501,7 +500,7 @@ class AnimationInpaintPipeline(DiffusionPipeline):
                                 torch.tensor([t])
                             )
 
-                        latents[:, :, keyframe_numbers, :, :] = keyframes_latents_orig_proper
+                        latents[:, :, keyframe_numbers] = keyframes_latents_orig_proper
 
                     # call the callback, if provided
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
