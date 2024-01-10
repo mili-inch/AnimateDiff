@@ -4,9 +4,7 @@ This repository is implementation of video inpainting pipeline based on AnimateD
 
 Reference:
 [AnimateDiff: Animate Your Personalized Text-to-Image Diffusion Models without Specific Tuning](https://arxiv.org/abs/2307.04725)
-
 [Video Diffusion Models](https://arxiv.org/abs/2204.03458)
-
 [Pseudoinverse-Guided Diffusion Models for Inverse Problems](https://openreview.net/forum?id=9_gsMA8MRKQ)
 
 Below is the original README of AnimateDiff.
